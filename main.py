@@ -1,8 +1,8 @@
 import json, math, os
 from datetime import datetime, timezone
 
-IN = os.environ.get('MAKEFUN_INPUT_DIR', '.')
-OUT = os.environ.get('MAKEFUN_OUTPUT_DIR', '.')
+IN = os.environ.get('MAKEFUN_INPUT_DIR') or '/input'
+OUT = os.environ.get('MAKEFUN_OUTPUT_DIR') or '/output'
 
 MOMENTUM_CAP_H = 3.0
 
