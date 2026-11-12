@@ -1,143 +1,122 @@
-import json
-import math
-import os
-import pathlib
-from datetime import datetime
+import json, math, os
+from datetime import datetime, timezone
 
-INPUT_DIR = pathlib.Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = pathlib.Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+IN = os.environ.get('MAKEFUN_INPUT_DIR', '.')
+OUT = os.environ.get('MAKEFUN_OUTPUT_DIR', '.')
 
-MICRO = 1_000_000
-MOMENTUM_WINDOW_H = 1.5
-MOMENTUM_SHRINK = 0.35
-# pump momentum fades: never extrapolate it past this many hours
 MOMENTUM_CAP_H = 3.0
-# the rank kernel widens with the forecast horizon: over ten hours a place is far less sure
-KERNEL_BASE = 0.18
-KERNEL_PER_HOUR = 0.015
-# share of each place left unnamed for coins born after the cut and for movers
-NEWCOMER_BASE = 0.28
-NEWCOMER_PER_PLACE = 0.03
-CANDIDATES = 10
-MAX_RISE = 1.0
-MAX_FALL = 1.2
 
 
-def parse_ts(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+def parse_ts(s):
+    try:
+        d = datetime.fromisoformat(str(s).replace('Z', '+00:00'))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.timestamp()
+    except Exception:
+        return None
 
 
-def load_marks(path):
-    marks = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
+def ncdf(x, mu, sd):
+    return 0.5 * (1.0 + math.erf((x - mu) / (sd * math.sqrt(2.0))))
+
+
+def main():
+    with open(os.path.join(IN, 'task.json')) as f:
+        task = json.load(f)
+    places = int(task.get('places', 5))
+    reads = task.get('reads') or []
+    edges = list(task['size']['edges'])
+    if edges and max(edges) > 1000:
+        edges = [math.log10(e / 1e9) if e > 0 else -1e9 for e in edges]
+    nbins = len(edges) - 1
+
+    last = None
+    with open(os.path.join(IN, 'history.ndjson')) as f:
+        for line in f:
             line = line.strip()
             if not line:
                 continue
-            mark = json.loads(line)
-            if mark.get("ok") and isinstance(mark.get("rows"), list):
-                marks.append(mark)
-    return marks
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get('rows'):
+                last = obj
+    rows = last['rows']
+
+    best = {}
+    for r in rows:
+        try:
+            mc = int(r['market_cap_lamports'])
+        except Exception:
+            continue
+        if mc <= 0:
+            continue
+        m = r['mint']
+        if m not in best or mc > best[m]:
+            best[m] = mc
+    ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
+    logs = [(m, math.log10(mc / 1e9)) for m, mc in ranked]
+    top = logs[:60]
+
+    # horizon in hours between last mark and last read
+    mark_ts = None
+    for k in ('ts', 'timestamp', 'time', 'mark', 'at', 'created_at'):
+        if k in last:
+            mark_ts = parse_ts(last[k])
+            if mark_ts is not None:
+                break
+    if mark_ts is None:
+        cs = [parse_ts(r.get('created_at')) for r in rows]
+        cs = [c for c in cs if c is not None]
+        mark_ts = max(cs) if cs else None
+    read_ts = [parse_ts(x) for x in reads]
+    read_ts = [x for x in read_ts if x is not None]
+    if mark_ts is not None and read_ts:
+        horizon_h = max(0.0, (max(read_ts) - mark_ts) / 3600.0)
+    else:
+        horizon_h = 1.0
+    horizon_h = min(horizon_h, 24.0 * 30)
+
+    # rank momentum (rank-shuffling spread) is damped: capped at 3h horizon
+    rank_h = min(horizon_h, MOMENTUM_CAP_H)
+
+    probs = []
+    n = len(top)
+    tau = 2.0 + 0.5 * math.sqrt(rank_h)
+    for k in range(1, places + 1):
+        ws = [math.exp(-abs(i - (k - 1)) / tau) * math.exp(-0.02 * i) for i in range(n)]
+        tot = sum(ws)
+        for i, (m, _) in enumerate(top):
+            probs.append({'mint': m, 'place': k, 'p': ws[i] / tot})
+
+    top5 = [m for m, _ in top[:5]]
+    i = 0
+    while len(top5) < 5:
+        top5.append('pad%d' % i)
+        i += 1
+
+    # size sd keeps growing with the full forecast horizon
+    sizes = []
+    sd = 0.10 + 0.05 * math.sqrt(horizon_h)
+    for k in range(1, places + 1):
+        idx = min(k - 1, n - 1)
+        mu = top[idx][1] if n else 0.0
+        sd_k = sd * (1.0 + 0.05 * (k - 1))
+        cdfs = [ncdf(e, mu, sd_k) for e in edges]
+        ps = [max(0.0, cdfs[b + 1] - cdfs[b]) for b in range(nbins)]
+        s = sum(ps)
+        if s <= 1e-12:
+            ps = [1.0 / nbins] * nbins
+        else:
+            ps = [p / s for p in ps]
+        for b in range(nbins):
+            sizes.append({'place': k, 'bin': b, 'p': ps[b]})
+
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, 'forecast.json'), 'w') as f:
+        json.dump({'probabilities': probs, 'top5': top5, 'sizes': sizes}, f)
 
 
-def logcap(lamports):
-    return math.log10(int(lamports)) - 9.0
-
-
-task = json.loads((INPUT_DIR / "task.json").read_text())
-places = int(task["places"])
-edges = task["size"]["edges"]
-marks = load_marks(INPUT_DIR / "history.ndjson")
-if not marks:
-    raise SystemExit("the history holds no ok mark")
-
-t0 = parse_ts(task["t0"])
-
-
-def hours_of(mark):
-    return (parse_ts(mark["at"]) - t0).total_seconds() / 3600.0
-
-
-series = {}
-for mark in marks:
-    t = hours_of(mark)
-    for row in mark["rows"]:
-        cap = int(row["market_cap_lamports"])
-        if cap > 0:
-            series.setdefault(row["mint"], []).append((t, logcap(cap)))
-
-last = marks[-1]
-last_t = hours_of(last)
-last_cap = {
-    row["mint"]: logcap(row["market_cap_lamports"])
-    for row in last["rows"]
-    if int(row["market_cap_lamports"]) > 0
-}
-reads = [hours_of({"at": r}) for r in task["reads"]]
-target = reads[len(reads) // 2]
-horizon = max(0.0, target - last_t)
-
-
-def recent_rate(mint):
-    points = [(t, v) for t, v in series.get(mint, []) if t >= last_t - MOMENTUM_WINDOW_H]
-    if len(points) < 2:
-        return 0.0
-    n = len(points)
-    sx = sum(p[0] for p in points)
-    sy = sum(p[1] for p in points)
-    sxx = sum(p[0] * p[0] for p in points)
-    sxy = sum(p[0] * p[1] for p in points)
-    den = n * sxx - sx * sx
-    if den <= 0:
-        return 0.0
-    return max(-1.5, min(1.5, (n * sxy - sx * sy) / den))
-
-
-predicted = {}
-for mint, cap in last_cap.items():
-    moved = cap + recent_rate(mint) * MOMENTUM_SHRINK * min(horizon, MOMENTUM_CAP_H)
-    predicted[mint] = max(cap - MAX_FALL, min(cap + MAX_RISE, moved))
-
-order = sorted(predicted.items(), key=lambda kv: (-kv[1], kv[0]))
-if len(order) < places:
-    raise SystemExit(f"the last mark ranks {len(order)} coins, fewer than the {places} places")
-
-size_sd = min(0.85, max(0.35, 0.30 * max(horizon, 0.5) ** 0.45))
-rank_sd = KERNEL_BASE + KERNEL_PER_HOUR * horizon
-
-
-def bin_weights(mean, sd):
-    out = []
-    for b in range(len(edges) + 1):
-        lo = -math.inf if b == 0 else edges[b - 1]
-        hi = math.inf if b == len(edges) else edges[b]
-        p_lo = 1.0 if lo == -math.inf else 0.5 * math.erfc((lo - mean) / (sd * math.sqrt(2)))
-        p_hi = 0.0 if hi == math.inf else 0.5 * math.erfc((hi - mean) / (sd * math.sqrt(2)))
-        units = int(math.floor((p_lo - p_hi) * MICRO))
-        if units > 0:
-            out.append({"bin": b, "p": units / MICRO})
-    return out
-
-
-candidates = order[: max(CANDIDATES, places)]
-probabilities = []
-for k in range(places):
-    base = order[k][1]
-    weights = [math.exp(-0.5 * ((v - base) / rank_sd) ** 2) for _, v in candidates]
-    total = sum(weights)
-    budget = 1.0 - min(0.80, NEWCOMER_BASE + NEWCOMER_PER_PLACE * k)
-    for (mint, _), w in zip(candidates, weights):
-        units = int(math.floor(w / total * budget * MICRO))
-        if units > 0:
-            probabilities.append({"mint": mint, "place": k + 1, "p": units / MICRO})
-
-sizes = []
-for k in range(places):
-    for row in bin_weights(order[k][1], size_sd):
-        sizes.append({"place": k + 1, "bin": row["bin"], "p": row["p"]})
-
-top5 = [mint for mint, _ in order[:places]]
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-(OUTPUT_DIR / task.get("output", "forecast.json")).write_text(
-    json.dumps({"probabilities": probabilities, "top5": top5, "sizes": sizes}) + "\n"
-)
+main()
